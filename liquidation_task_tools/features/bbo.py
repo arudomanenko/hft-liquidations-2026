@@ -53,20 +53,6 @@ class BboFeature(Feature):
             "snap_valid": snap_valid,
         }
 
-        return {
-            "bbo_ts": bbo_ts,
-            "trades_ts": trades_ts,
-            "bid_price": bid_price,
-            "ask_price": ask_price,
-            "bid_amount": bid_amount,
-            "ask_amount": ask_amount,
-            "mid_price": mid_price,
-            "left": left,
-            "right": right,
-            "snap_idx": snap_idx,
-            "snap_valid": snap_valid,
-        }
-
     def calculate_max_used_ts(self, **data) -> np.ndarray:
         trades_ts = data["trades_ts"]
         bbo_ts = data["bbo_ts"]
@@ -342,3 +328,115 @@ class TradeSideBboMidSmoothDeltaBps(BboFeature):
         sign = _trade_side_sign(data["trades"]).astype(np.float32)
         return (base[:, 0] * sign).reshape((-1, 1)), trades_ts, max_used_ts
 
+
+class BboOrderFlowImbalance(BboFeature):
+    def __init__(self, name: str = "bbo_order_flow_imbalance"):
+        super().__init__(name)
+
+    def calculate(self, **data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        ctx = self._prepare_bbo_window(**data)
+
+        bbo_ts = ctx["bbo_ts"]
+        bid_price = ctx["bid_price"]
+        ask_price = ctx["ask_price"]
+        bid_amount = ctx["bid_amount"]
+        ask_amount = ctx["ask_amount"]
+
+        n = len(bbo_ts)
+        e = np.zeros(n, dtype=np.float64)
+
+        if n > 0:
+            e[0] = bid_amount[0] - ask_amount[0]
+
+        if n > 1:
+            bid_up = bid_price[1:] > bid_price[:-1]
+            bid_same = bid_price[1:] == bid_price[:-1]
+            ask_down = ask_price[1:] < ask_price[:-1]
+            ask_same = ask_price[1:] == ask_price[:-1]
+
+            e[1:] += np.where(
+                bid_up,
+                bid_amount[1:],
+                np.where(bid_same, bid_amount[1:] - bid_amount[:-1], -bid_amount[:-1]),
+            )
+
+            e[1:] += np.where(
+                ask_down,
+                ask_amount[1:],
+                np.where(ask_same, ask_amount[1:] - ask_amount[:-1], -ask_amount[:-1]),
+            ) * (-1.0)
+
+        e_cum = np.r_[0.0, np.cumsum(e, dtype=np.float64)]
+        ofi_sum = e_cum[ctx["right"]] - e_cum[ctx["left"]]
+
+        feature = ofi_sum.astype(np.float32).reshape((-1, 1))
+        max_used_ts = self.calculate_max_used_ts(
+            trades_ts=ctx["trades_ts"],
+            bbo_ts=bbo_ts,
+            most_recent=ctx["right"],
+            least_recent=ctx["left"],
+        )
+        return feature, ctx["trades_ts"], max_used_ts
+
+
+class BboOrderFlowImbalanceNorm(BboFeature):
+    def __init__(self, name: str = "bbo_order_flow_imbalance_norm"):
+        super().__init__(name)
+
+    def calculate(self, **data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        ofi, trades_ts, max_used_ts = BboOrderFlowImbalance().calculate(**data)
+        ctx = self._prepare_bbo_window(**data)
+
+        feature = np.zeros_like(trades_ts, dtype=np.float64)
+        valid = ctx["snap_valid"]
+        if np.any(valid):
+            idx = ctx["snap_idx"][valid]
+            depth = ctx["bid_amount"][idx] + ctx["ask_amount"][idx]
+            feature[valid] = np.divide(
+                ofi[:, 0][valid].astype(np.float64),
+                depth,
+                out=np.zeros_like(depth, dtype=np.float64),
+                where=depth > 0,
+            )
+
+        return feature.astype(np.float32).reshape((-1, 1)), trades_ts, max_used_ts
+
+class BboDepthImbalanceValue(BboFeature):
+    def __init__(self, name: str = "bbo_depth_imbalance_value"):
+        super().__init__(name)
+
+    def calculate(self, **data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        ctx = self._prepare_bbo_window(**data)
+        feature = np.zeros_like(ctx["trades_ts"], dtype=np.float64)
+        valid = ctx["snap_valid"]
+        if np.any(valid):
+            idx = ctx["snap_idx"][valid]
+            bid_val = ctx["bid_price"][idx] * ctx["bid_amount"][idx]
+            ask_val = ctx["ask_price"][idx] * ctx["ask_amount"][idx]
+            denom = bid_val + ask_val
+            feature[valid] = np.divide(
+                bid_val - ask_val,
+                denom,
+                out=np.zeros_like(denom, dtype=np.float64),
+                where=denom > 0,
+            )
+
+        feature = feature.astype(np.float32).reshape((-1, 1))
+        max_used_ts = self.calculate_max_used_ts(
+            trades_ts=ctx["trades_ts"],
+            bbo_ts=ctx["bbo_ts"],
+            most_recent=ctx["snap_idx"] + 1,
+            least_recent=ctx["snap_idx"],
+            mask=valid,
+        )
+        return feature, ctx["trades_ts"], max_used_ts
+
+
+class TradeSideBboOrderFlowImbalance(BboFeature):
+    def __init__(self, name: str = "trade_side_bbo_order_flow_imbalance"):
+        super().__init__(name)
+
+    def calculate(self, **data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        base, trades_ts, max_used_ts = BboOrderFlowImbalance().calculate(**data)
+        sign = _trade_side_sign(data["trades"]).astype(np.float32)
+        return (base[:, 0] * sign).reshape((-1, 1)), trades_ts, max_used_ts

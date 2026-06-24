@@ -34,3 +34,7 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Project data and artifacts
+artifacts/
+liquidation_task/

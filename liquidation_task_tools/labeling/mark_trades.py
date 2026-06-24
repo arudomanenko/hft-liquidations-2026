@@ -31,14 +31,16 @@ def calculate_model_pnl(
         target_ts = trade_ts + tau_sec * SECOND
         idx = np.searchsorted(bbo_ts, target_ts, side="right") - 1
         valid[:, col] = (idx >= 0) & (target_ts <= bbo_ts[-1])
+
         exit_mid = mid[idx[valid[:, col]]]
-        pnl[valid[:, col], col] = (
+        current_pnl = (
             -sign[valid[:, col]]
             * (exit_mid - price[valid[:, col]])
             / price[valid[:, col]]
             * 10_000.0
             + rebate_bps
         )
+        pnl[valid[:, col], col] = current_pnl
 
     if filter_mask is None:
         filter_mask = np.zeros_like(pnl, dtype=bool)

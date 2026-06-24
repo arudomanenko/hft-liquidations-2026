@@ -5,11 +5,11 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 
-class CatBoostChunkRanker:
+class CatBoostChunkRegressor:
     def __init__(self, **model_params: Any) -> None:
-        from catboost import CatBoostRanker
+        from catboost import CatBoostRegressor
 
-        self._model = CatBoostRanker(**model_params)
+        self._model = CatBoostRegressor(**model_params)
         self._fitted = False
 
     def partial_fit(
@@ -17,13 +17,10 @@ class CatBoostChunkRanker:
         X: np.ndarray,
         y: np.ndarray,
         sample_weight: Optional[np.ndarray] = None,
-        group_id: Optional[np.ndarray] = None,
-    ) -> "CatBoostChunkRanker":
+    ) -> "CatBoostChunkRegressor":
         fit_kwargs: Dict[str, Any] = {}
         if sample_weight is not None:
             fit_kwargs["sample_weight"] = sample_weight
-        if group_id is not None:
-            fit_kwargs["group_id"] = group_id
         if self._fitted:
             fit_kwargs["init_model"] = self._model
         self._model.fit(X, y, **fit_kwargs)
@@ -37,13 +34,13 @@ class CatBoostChunkRanker:
 
 
 def build_model(model_type: str, task: str, model_params: Optional[Dict[str, Any]] = None) -> Any:
-    if task.lower() != "ranking":
-        raise ValueError("Only 'ranking' task is supported")
+    if task.lower() != "regression":
+        raise ValueError("Only 'regression' task is supported")
     if model_type.lower() != "catboost_chunk":
         raise ValueError("Only 'catboost_chunk' model_type is supported")
     params = dict(
         {
-            "loss_function": "YetiRank",
+            "loss_function": "RMSE",
             "iterations": 2000,
             "depth": 6,
             "learning_rate": 0.03,
@@ -53,7 +50,7 @@ def build_model(model_type: str, task: str, model_params: Optional[Dict[str, Any
         }
         | dict(model_params or {})
     )
-    return CatBoostChunkRanker(**params)
+    return CatBoostChunkRegressor(**params)
 
 
 def supports_partial_fit(model: Any) -> bool:
@@ -61,5 +58,5 @@ def supports_partial_fit(model: Any) -> bool:
 
 
 def supports_warm_start_growth(model: Any) -> bool:
-    return False
+    return bool(getattr(model, "warm_start", False)) and callable(getattr(model, "fit", None))
 

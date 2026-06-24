@@ -157,3 +157,26 @@ class TradeSideLiquidationStrength(LiquidationFeature):
         sign = _trade_side_sign(data["trades"]).astype(np.float32)
         return (base[:, 0] * sign).reshape((-1, 1)), trades_ts, max_used_ts
 
+
+class LiqudationMeanNotionalPerEventLog(LiquidationFeature):
+    def __init__(self, name: str = "liquidation_mean_notional_per_event_log"):
+        super().__init__(name)
+
+    def calculate(self, **data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        buy_notional, sell_notional, trades_ts, liq_ts, right, left = self._prepare_window_notionals(**data)
+        total_notional = buy_notional + sell_notional
+        count = right - left
+        mean_notional = np.divide(
+            total_notional,
+            count,
+            out=np.zeros_like(total_notional, dtype=np.float64),
+            where=count > 0,
+        )
+        feature = np.log1p(mean_notional).astype(np.float32).reshape((-1, 1))
+        max_used_ts = self.calculate_max_used_ts(
+            trades_ts=trades_ts,
+            liq_ts=liq_ts,
+            most_recent=right,
+            least_recent=left,
+        )
+        return feature, trades_ts, max_used_ts

@@ -6,7 +6,6 @@ import polars as pl
 
 from liquidation_task_tools.base import Feature
 from liquidation_task_tools.training.model_pipeline import (
-    ClassificationPipeline,
     FeatureSpec,
     ModelPipeline,
     RegressionPipeline,
@@ -207,34 +206,6 @@ class TestModelPipeline(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             pipeline.fit(log_i_chunk=-2)
-
-
-class TestClassificationPipeline(unittest.TestCase):
-    def test_classification_pipeline_builds_filter_and_keep_masks(self):
-        chunk = make_chunk([10, 20, 30, 40], [-3.0, -0.5, 0.5, 3.0])
-        loader = StaticChunkLoader([chunk])
-        pipeline = ClassificationPipeline(
-            model=DummyPartialFitClassifier(),
-            feature_specs=build_feature_specs(),
-            data_loader=loader,
-            target_builder=build_classification_target,
-            sample_weight_builder=lambda c: np.ones(c["trades"].height, dtype=np.float32),
-            classes=np.array([0, 1], dtype=np.int8),
-        )
-
-        pipeline.fit()
-        probas = pipeline.predict_chunk(chunk, proba=True)
-        filter_mask = pipeline.predict_filter_mask_chunk(chunk, threshold=0.5)
-        keep_mask = pipeline.predict_keep_mask_chunk(chunk, threshold=0.5)
-
-        self.assertEqual(probas.shape, (4, 2))
-        np.testing.assert_array_equal(
-            pipeline.model.first_call_classes,
-            np.array([0, 1], dtype=np.int8),
-        )
-        self.assertEqual(filter_mask.dtype, np.int8)
-        self.assertEqual(keep_mask.dtype, np.int8)
-        np.testing.assert_array_equal(keep_mask, (1 - filter_mask).astype(np.int8))
 
 
 class TestRegressionPipeline(unittest.TestCase):

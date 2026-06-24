@@ -11,12 +11,11 @@ from liquidation_task_tools.base import Feature
 from liquidation_task_tools.loaders import ParquetDataLoader
 from liquidation_task_tools.validation import ValidationErrorReason, validate
 
-from .models import supports_partial_fit
+from .models import supports_partial_fit, supports_warm_start_growth
 
 Chunk = Mapping[str, pl.DataFrame]
 TargetBuilder = Callable[[Chunk], np.ndarray]
 SampleWeightBuilder = Callable[[Chunk], Optional[np.ndarray]]
-GroupIdBuilder = Callable[[Chunk], np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -34,13 +33,11 @@ class ModelPipeline:
         data_loader: ParquetDataLoader,
         sample_weight_builder: Optional[SampleWeightBuilder],
         target_builder: TargetBuilder,
-        group_id_builder: Optional[GroupIdBuilder] = None,
     ):
         self._feature_specs = list(feature_specs)
         self._data_loader = data_loader
         self._target_builder = target_builder
         self._sample_weight_builder = sample_weight_builder
-        self._group_id_builder = group_id_builder
         self._model = model
 
     @property
@@ -96,18 +93,12 @@ class ModelPipeline:
             return None
         return np.asarray(weights)
 
-    def _compute_group_id(self, chunk: Chunk) -> Optional[np.ndarray]:
-        if self._group_id_builder is None:
-            return None
-        return np.asarray(self._group_id_builder(chunk))
-
     @staticmethod
     def _filter_training_rows(
         X: np.ndarray,
         y: np.ndarray,
         sample_weight: Optional[np.ndarray],
-        group_id: Optional[np.ndarray],
-    ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         keep_mask = np.isfinite(y)
         if sample_weight is not None:
             keep_mask = keep_mask & np.isfinite(sample_weight)
@@ -119,19 +110,18 @@ class ModelPipeline:
             raise ValueError("Filtered row mask size must match target size")
 
         if np.all(keep_mask):
-            return X, y, sample_weight, group_id
+            return X, y, sample_weight
 
         X_filtered = X[keep_mask]
         y_filtered = y[keep_mask]
         sample_weight_filtered = sample_weight[keep_mask] if sample_weight is not None else None
-        group_id_filtered = group_id[keep_mask] if group_id is not None else None
-        return X_filtered, y_filtered, sample_weight_filtered, group_id_filtered
+        return X_filtered, y_filtered, sample_weight_filtered
 
-    def _fit_stream(self, data_stream: Iterable[Chunk]) -> int:
+    def _fit_stream(self, data_stream: Iterable[Chunk], log_i_chunk: Optional[int] = 1) -> int:
         trained_chunks = 0
         first_chunk = True
 
-        for chunk in data_stream:
+        for chunk_idx, chunk in enumerate(data_stream, start=1):
             X = self._compute_feature_matrix(chunk)
             y = self._compute_target(chunk)
             if y.shape[0] != X.shape[0]:
@@ -140,31 +130,24 @@ class ModelPipeline:
             sample_weight = self._compute_sample_weights(chunk)
             if sample_weight is not None and sample_weight.shape[0] != X.shape[0]:
                 raise ValueError("sample_weight size must match feature matrix rows")
-            group_id = self._compute_group_id(chunk)
-            if group_id is not None and group_id.shape[0] != X.shape[0]:
-                raise ValueError("group_id size must match feature matrix rows")
 
-            X, y, sample_weight, group_id = self._filter_training_rows(
-                X, y, sample_weight, group_id
-            )
+            X, y, sample_weight = self._filter_training_rows(X, y, sample_weight)
             if X.shape[0] == 0:
                 continue
 
-            self._fit_on_chunk(X, y, sample_weight, group_id, is_first_chunk=first_chunk)
+            self._fit_on_chunk(X, y, sample_weight, is_first_chunk=first_chunk)
             first_chunk = False
             trained_chunks += 1
+            if log_i_chunk is not None and chunk_idx % log_i_chunk == 0:
+                print(f"Training chunk={chunk_idx} rows={X.shape[0]}")
 
         return trained_chunks
 
     @staticmethod
-    def _build_fit_kwargs(
-        sample_weight: Optional[np.ndarray], group_id: Optional[np.ndarray]
-    ) -> Dict[str, Any]:
+    def _build_fit_kwargs(sample_weight: Optional[np.ndarray]) -> Dict[str, Any]:
         fit_kwargs: Dict[str, Any] = {}
         if sample_weight is not None:
             fit_kwargs["sample_weight"] = sample_weight
-        if group_id is not None:
-            fit_kwargs["group_id"] = group_id
         return fit_kwargs
 
     def _partial_fit_first_chunk_kwargs(self) -> Dict[str, Any]:
@@ -182,10 +165,9 @@ class ModelPipeline:
         X: np.ndarray,
         y: np.ndarray,
         sample_weight: Optional[np.ndarray],
-        group_id: Optional[np.ndarray],
         is_first_chunk: bool,
     ) -> None:
-        fit_kwargs = self._build_fit_kwargs(sample_weight, group_id)
+        fit_kwargs = self._build_fit_kwargs(sample_weight)
 
         if supports_partial_fit(self._model):
             self._fit_partial_fit_chunk(X, y, fit_kwargs, is_first_chunk)
@@ -195,17 +177,22 @@ class ModelPipeline:
 
     def fit(
         self,
+        log_i_chunk: Optional[int] = 1,
     ) -> "ModelPipeline":
+        if log_i_chunk is not None and log_i_chunk <= 0:
+            raise ValueError("log_i_chunk must be positive or None")
         self._data_loader.reset()
 
         try:
-            trained_chunks = self._fit_stream(self._data_loader)
+            trained_chunks = self._fit_stream(self._data_loader, log_i_chunk=log_i_chunk)
         finally:
             self._data_loader.reset()
 
         if trained_chunks == 0:
             raise ValueError("No non-empty chunks were used for training")
 
+        if log_i_chunk is not None:
+            print(f"Training finished: chunks={trained_chunks}")
         return self
 
     def _prepare_prediction_matrix(self, chunk: Chunk) -> np.ndarray:
@@ -219,5 +206,38 @@ class ModelPipeline:
         return self._model.predict(X)
 
 
-class RankingPipeline(ModelPipeline):
-    pass
+class RegressionPipeline(ModelPipeline):
+    def __init__(
+        self,
+        model: Any,
+        feature_specs: Sequence[FeatureSpec],
+        data_loader: ParquetDataLoader,
+        sample_weight_builder: Optional[SampleWeightBuilder],
+        target_builder: TargetBuilder,
+        warm_start_estimators_step: int = 1,
+    ):
+        super().__init__(
+            model=model,
+            feature_specs=feature_specs,
+            data_loader=data_loader,
+            sample_weight_builder=sample_weight_builder,
+            target_builder=target_builder,
+        )
+        self._warm_start_estimators_step = warm_start_estimators_step
+        self._current_n_estimators = 0
+
+    def _fit_on_chunk(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        sample_weight: Optional[np.ndarray],
+        is_first_chunk: bool,
+    ) -> None:
+        if supports_warm_start_growth(self._model):
+            self._current_n_estimators += self._warm_start_estimators_step
+            self._model.set_params(n_estimators=self._current_n_estimators)
+            fit_kwargs = self._build_fit_kwargs(sample_weight)
+            self._model.fit(X, y, **fit_kwargs)
+            return
+
+        super()._fit_on_chunk(X, y, sample_weight, is_first_chunk=is_first_chunk)
