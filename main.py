@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ import polars as pl
 
 from liquidation_task_tools.constants import BYBIT_LIQUIDATION_DELAY_US, SECOND
 from liquidation_task_tools.features import (
+    BboDepthImbalanceValue,
     BboMicroPricePremiumBps,
     BboMidDeltaBps,
     BboMidSmoothDeltaBps,
@@ -20,27 +22,14 @@ from liquidation_task_tools.features import (
     BboSpreadBps,
     BboTopDepthLog,
     BboVolumeImbalance,
-    BboVolumeImbalanceAbs,
-    BboDepthImbalanceValue,
-    LiqudationClusterCount,
-    LiqudationClusterImbalance,
     LiqudationClusterStrength,
     LiqudationClusterTotalNotional,
-    LiqudationMeanNotionalPerEventLog,
     TradeBboEdgeBps,
     TradeFlowCountLog,
     TradeFlowImbalance,
     TradeFlowNotionalLog,
     TradeFlowToxicity,
-    TradeNotionalLog,
     TradeSide,
-    TradeSideBboMicroPricePremiumBps,
-    TradeSideBboMidDeltaBps,
-    TradeSideBboMidSmoothDeltaBps,
-    TradeSideBboOrderFlowImbalance,
-    TradeSideBboVolumeImbalance,
-    TradeSideFlowImbalance,
-    TradeSideLiquidationImbalance,
     TradeSideLiquidationStrength,
     TradeSignedNotionalLog,
 )
@@ -61,8 +50,8 @@ PARQUET_NAMES = [
     BYBIT_BTC_LIQ,
 ]
 
-HORIZON_SEC = 30
-TARGET_MAX_HORIZON_SEC = HORIZON_SEC
+HORIZONS_SEC = (30, 120, 300)
+TARGET_MAX_HORIZON_SEC = max(HORIZONS_SEC)
 MAX_FEATURE_LOOKBACK_SEC = 301
 MIN_TURNOVER_PER_DAY = 500_000.0
 
@@ -70,7 +59,6 @@ MIN_TURNOVER_PER_DAY = 500_000.0
 @dataclass(frozen=True)
 class Experiment:
     name: str
-    feature_specs: list[FeatureSpec]
 
 
 def _resolve_data_root() -> Path:
@@ -124,89 +112,164 @@ def _trade_fs(feature, window_us: int | None = None) -> FeatureSpec:
     return _fs(feature, {"trades": BINANCE_BTC_TRADES}, window_us=window_us)
 
 
-def _build_30s_feature_specs() -> list[FeatureSpec]:
+def _build_feature_specs(horizon_sec: int) -> list[FeatureSpec]:
     w5 = 5 * SECOND
+    w15 = 15 * SECOND
     w30 = 30 * SECOND
-    w120 = 120 * SECOND
 
-    return [
-        _trade_fs(TradeSide()),
-        _trade_fs(TradeNotionalLog()),
-        _trade_fs(TradeSignedNotionalLog()),
+    if horizon_sec == 30:
+        return [
+            _trade_fs(TradeSide()),
+            _trade_fs(TradeSignedNotionalLog()),
+            _bbo_fs(BboSpreadBps(), w30),
+            _bbo_fs(BboTopDepthLog(), w30),
+            _bbo_fs(BboVolumeImbalance(name="bbo_vol_imb_15s"), w15),
+            _bbo_fs(BboVolumeImbalance(name="bbo_vol_imb_30s"), w30),
+            _bbo_fs(BboDepthImbalanceValue(name="bbo_depth_imb_value_15s"), w15),
+            _bbo_fs(BboDepthImbalanceValue(name="bbo_depth_imb_value_30s"), w30),
+            _bbo_fs(BboMicroPricePremiumBps(name="bbo_microprice_premium_15s"), w15),
+            _bbo_fs(BboMicroPricePremiumBps(name="bbo_microprice_premium_30s"), w30),
+            _bbo_fs(TradeBboEdgeBps(name="trade_bbo_edge_15s"), w15),
+            _bbo_fs(TradeBboEdgeBps(name="trade_bbo_edge_30s"), w30),
+            _bbo_fs(BboMidSmoothDeltaBps(name="bbo_mid_smooth_delta_15s"), w15),
+            _bbo_fs(BboMidSmoothDeltaBps(name="bbo_mid_smooth_delta_30s"), w30),
+            _bbo_fs(BboMidDeltaBps(name="bbo_mid_delta_bps_5s"), w5),
+            _bbo_fs(BboMidDeltaBps(name="bbo_mid_delta_bps_15s"), w15),
+            _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_5s"), w5),
+            _bbo_fs(BboOrderFlowImbalanceNorm(name="bbo_ofi_norm_5s"), w5),
+            _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_15s"), w15),
+            _bbo_fs(BboOrderFlowImbalanceNorm(name="bbo_ofi_norm_15s"), w15),
+            _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_30s"), w30),
+            _trade_fs(TradeFlowImbalance(name="trade_flow_imbalance_5s"), w5),
+            _trade_fs(TradeFlowImbalance(name="trade_flow_imbalance_15s"), w15),
+            _trade_fs(TradeFlowToxicity(name="trade_flow_toxicity_5s"), w5),
+            _trade_fs(TradeFlowToxicity(name="trade_flow_toxicity_15s"), w15),
+            _trade_fs(TradeFlowNotionalLog(name="trade_flow_notional_log_15s"), w15),
+            _trade_fs(TradeFlowNotionalLog(name="trade_flow_notional_log_30s"), w30),
+            _trade_fs(TradeFlowCountLog(name="trade_flow_count_log_15s"), w15),
+            _trade_fs(TradeFlowCountLog(name="trade_flow_count_log_30s"), w30),
+            _binance_liq_fs(LiqudationClusterStrength(name="binance_liq_strength_15s"), w15),
+            _binance_liq_fs(LiqudationClusterStrength(name="binance_liq_strength_30s"), w30),
+            _binance_liq_fs(LiqudationClusterTotalNotional(name="binance_liq_total_notional_30s"), w30),
+            _binance_liq_fs(TradeSideLiquidationStrength(name="trade_side_binance_liq_strength_30s"), w30),
+            _bybit_liq_fs(LiqudationClusterStrength(name="bybit_liq_strength_15s"), w15),
+            _bybit_liq_fs(LiqudationClusterStrength(name="bybit_liq_strength_30s"), w30),
+            _bybit_liq_fs(LiqudationClusterTotalNotional(name="bybit_liq_total_notional_30s"), w30),
+        ]
 
-        _bbo_fs(BboSpreadBps(), w30),
-        _bbo_fs(BboTopDepthLog(), w30),
-        _bbo_fs(BboVolumeImbalance(), w30),
-        _bbo_fs(BboVolumeImbalanceAbs(), w30),
-        _bbo_fs(BboDepthImbalanceValue(), w30),
-        _bbo_fs(BboMicroPricePremiumBps(), w30),
-        _bbo_fs(TradeBboEdgeBps(), w30),
-        _bbo_fs(BboMidSmoothDeltaBps(), w30),
+    if horizon_sec == 120:
+        w60 = 60 * SECOND
+        w120 = 120 * SECOND
+        return [
+            _trade_fs(TradeSide()),
+            _trade_fs(TradeSignedNotionalLog()),
+            _bbo_fs(BboSpreadBps(), w30),
+            _bbo_fs(BboTopDepthLog(), w30),
+            _bbo_fs(BboVolumeImbalance(name="bbo_vol_imb_30s"), w30),
+            _bbo_fs(BboVolumeImbalance(name="bbo_vol_imb_120s"), w120),
+            _bbo_fs(BboDepthImbalanceValue(name="bbo_depth_imb_value_30s"), w30),
+            _bbo_fs(BboDepthImbalanceValue(name="bbo_depth_imb_value_120s"), w120),
+            _bbo_fs(BboMicroPricePremiumBps(name="bbo_microprice_premium_30s"), w30),
+            _bbo_fs(BboMicroPricePremiumBps(name="bbo_microprice_premium_120s"), w120),
+            _bbo_fs(TradeBboEdgeBps(name="trade_bbo_edge_30s"), w30),
+            _bbo_fs(TradeBboEdgeBps(name="trade_bbo_edge_120s"), w120),
+            _bbo_fs(BboMidSmoothDeltaBps(name="bbo_mid_smooth_delta_30s"), w30),
+            _bbo_fs(BboMidSmoothDeltaBps(name="bbo_mid_smooth_delta_120s"), w120),
+            _bbo_fs(BboMidDeltaBps(name="bbo_mid_delta_bps_15s"), w15),
+            _bbo_fs(BboMidDeltaBps(name="bbo_mid_delta_bps_60s"), w60),
+            _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_15s"), w15),
+            _bbo_fs(BboOrderFlowImbalanceNorm(name="bbo_ofi_norm_15s"), w15),
+            _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_60s"), w60),
+            _bbo_fs(BboOrderFlowImbalanceNorm(name="bbo_ofi_norm_60s"), w60),
+            _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_120s"), w120),
+            _trade_fs(TradeFlowImbalance(name="trade_flow_imbalance_15s"), w15),
+            _trade_fs(TradeFlowImbalance(name="trade_flow_imbalance_60s"), w60),
+            _trade_fs(TradeFlowToxicity(name="trade_flow_toxicity_15s"), w15),
+            _trade_fs(TradeFlowToxicity(name="trade_flow_toxicity_60s"), w60),
+            _trade_fs(TradeFlowNotionalLog(name="trade_flow_notional_log_60s"), w60),
+            _trade_fs(TradeFlowNotionalLog(name="trade_flow_notional_log_120s"), w120),
+            _trade_fs(TradeFlowCountLog(name="trade_flow_count_log_60s"), w60),
+            _trade_fs(TradeFlowCountLog(name="trade_flow_count_log_120s"), w120),
+            _binance_liq_fs(LiqudationClusterStrength(name="binance_liq_strength_30s"), w30),
+            _binance_liq_fs(LiqudationClusterStrength(name="binance_liq_strength_120s"), w120),
+            _binance_liq_fs(LiqudationClusterTotalNotional(name="binance_liq_total_notional_120s"), w120),
+            _binance_liq_fs(TradeSideLiquidationStrength(name="trade_side_binance_liq_strength_120s"), w120),
+            _bybit_liq_fs(LiqudationClusterStrength(name="bybit_liq_strength_30s"), w30),
+            _bybit_liq_fs(LiqudationClusterStrength(name="bybit_liq_strength_120s"), w120),
+            _bybit_liq_fs(LiqudationClusterTotalNotional(name="bybit_liq_total_notional_120s"), w120),
+        ]
 
-        _bbo_fs(BboMidDeltaBps(name="bbo_mid_delta_bps_5s"), w5),
-        _bbo_fs(TradeSideBboMidDeltaBps(name="trade_side_bbo_mid_delta_bps_5s"), w5),
+    if horizon_sec == 300:
+        w30 = 30 * SECOND
+        w120 = 120 * SECOND
+        w300 = 300 * SECOND
+        return [
+            _trade_fs(TradeSide()),
+            _trade_fs(TradeSignedNotionalLog()),
+            _bbo_fs(BboSpreadBps(), w30),
+            _bbo_fs(BboTopDepthLog(), w30),
+            _bbo_fs(BboVolumeImbalance(name="bbo_vol_imb_30s"), w30),
+            _bbo_fs(BboVolumeImbalance(name="bbo_vol_imb_300s"), w300),
+            _bbo_fs(BboDepthImbalanceValue(name="bbo_depth_imb_value_30s"), w30),
+            _bbo_fs(BboDepthImbalanceValue(name="bbo_depth_imb_value_300s"), w300),
+            _bbo_fs(BboMicroPricePremiumBps(name="bbo_microprice_premium_30s"), w30),
+            _bbo_fs(BboMicroPricePremiumBps(name="bbo_microprice_premium_300s"), w300),
+            _bbo_fs(TradeBboEdgeBps(name="trade_bbo_edge_30s"), w30),
+            _bbo_fs(TradeBboEdgeBps(name="trade_bbo_edge_300s"), w300),
+            _bbo_fs(BboMidSmoothDeltaBps(name="bbo_mid_smooth_delta_30s"), w30),
+            _bbo_fs(BboMidSmoothDeltaBps(name="bbo_mid_smooth_delta_300s"), w300),
+            _bbo_fs(BboMidDeltaBps(name="bbo_mid_delta_bps_30s"), w30),
+            _bbo_fs(BboMidDeltaBps(name="bbo_mid_delta_bps_120s"), w120),
+            _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_30s"), w30),
+            _bbo_fs(BboOrderFlowImbalanceNorm(name="bbo_ofi_norm_30s"), w30),
+            _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_120s"), w120),
+            _bbo_fs(BboOrderFlowImbalanceNorm(name="bbo_ofi_norm_120s"), w120),
+            _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_300s"), w300),
+            _trade_fs(TradeFlowImbalance(name="trade_flow_imbalance_30s"), w30),
+            _trade_fs(TradeFlowImbalance(name="trade_flow_imbalance_120s"), w120),
+            _trade_fs(TradeFlowToxicity(name="trade_flow_toxicity_30s"), w30),
+            _trade_fs(TradeFlowToxicity(name="trade_flow_toxicity_120s"), w120),
+            _trade_fs(TradeFlowNotionalLog(name="trade_flow_notional_log_120s"), w120),
+            _trade_fs(TradeFlowNotionalLog(name="trade_flow_notional_log_300s"), w300),
+            _trade_fs(TradeFlowCountLog(name="trade_flow_count_log_120s"), w120),
+            _trade_fs(TradeFlowCountLog(name="trade_flow_count_log_300s"), w300),
+            _binance_liq_fs(LiqudationClusterStrength(name="binance_liq_strength_30s"), w30),
+            _binance_liq_fs(LiqudationClusterStrength(name="binance_liq_strength_300s"), w300),
+            _binance_liq_fs(LiqudationClusterTotalNotional(name="binance_liq_total_notional_300s"), w300),
+            _binance_liq_fs(TradeSideLiquidationStrength(name="trade_side_binance_liq_strength_300s"), w300),
+            _bybit_liq_fs(LiqudationClusterStrength(name="bybit_liq_strength_30s"), w30),
+            _bybit_liq_fs(LiqudationClusterStrength(name="bybit_liq_strength_300s"), w300),
+            _bybit_liq_fs(LiqudationClusterTotalNotional(name="bybit_liq_total_notional_300s"), w300),
+        ]
 
-        _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_5s"), w5),
-        _bbo_fs(BboOrderFlowImbalanceNorm(name="bbo_ofi_norm_5s"), w5),
-        _bbo_fs(TradeSideBboOrderFlowImbalance(name="trade_side_bbo_ofi_5s"), w5),
-
-        _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_30s"), w30),
-        _bbo_fs(BboOrderFlowImbalanceNorm(name="bbo_ofi_norm_30s"), w30),
-        _bbo_fs(TradeSideBboOrderFlowImbalance(name="trade_side_bbo_ofi_30s"), w30),
-
-        _bbo_fs(BboOrderFlowImbalance(name="bbo_ofi_120s"), w120),
-        _bbo_fs(BboOrderFlowImbalanceNorm(name="bbo_ofi_norm_120s"), w120),
-
-        _bbo_fs(TradeSideBboVolumeImbalance(), w30),
-        _bbo_fs(TradeSideBboMicroPricePremiumBps(), w30),
-        _bbo_fs(TradeSideBboMidSmoothDeltaBps(), w30),
-
-        _trade_fs(TradeFlowImbalance(name="trade_flow_imbalance_5s"), w5),
-        _trade_fs(TradeSideFlowImbalance(name="trade_side_flow_imbalance_5s"), w5),
-        _trade_fs(TradeFlowToxicity(name="trade_flow_toxicity_5s"), w5),
-        _trade_fs(TradeFlowNotionalLog(name="trade_flow_notional_log_5s"), w5),
-        _trade_fs(TradeFlowCountLog(name="trade_flow_count_log_5s"), w5),
-
-        _trade_fs(TradeFlowImbalance(name="trade_flow_imbalance_30s"), w30),
-        _trade_fs(TradeSideFlowImbalance(name="trade_side_flow_imbalance_30s"), w30),
-        _trade_fs(TradeFlowToxicity(name="trade_flow_toxicity_30s"), w30),
-        _trade_fs(TradeFlowNotionalLog(name="trade_flow_notional_log_30s"), w30),
-        _trade_fs(TradeFlowCountLog(name="trade_flow_count_log_30s"), w30),
-
-        _binance_liq_fs(LiqudationClusterImbalance(name="binance_liq_imbalance_30s"), w30),
-        _binance_liq_fs(LiqudationClusterStrength(name="binance_liq_strength_30s"), w30),
-        _binance_liq_fs(LiqudationClusterTotalNotional(name="binance_liq_total_notional_30s"), w30),
-        _binance_liq_fs(LiqudationClusterCount(name="binance_liq_count_30s"), w30),
-        _binance_liq_fs(TradeSideLiquidationImbalance(name="trade_side_binance_liq_imbalance_30s"), w30),
-        _binance_liq_fs(TradeSideLiquidationStrength(name="trade_side_binance_liq_strength_30s"), w30),
-        _binance_liq_fs(LiqudationMeanNotionalPerEventLog(name="binance_liq_mean_notional_per_event_30s"), w30),
-
-        _bybit_liq_fs(LiqudationClusterImbalance(name="bybit_liq_imbalance_30s"), w30),
-        _bybit_liq_fs(LiqudationClusterStrength(name="bybit_liq_strength_30s"), w30),
-        _bybit_liq_fs(LiqudationClusterTotalNotional(name="bybit_liq_total_notional_30s"), w30),
-        _bybit_liq_fs(TradeSideLiquidationStrength(name="trade_side_bybit_liq_strength_30s"), w30),
-        _bybit_liq_fs(LiqudationMeanNotionalPerEventLog(name="bybit_liq_mean_notional_per_event_30s"), w30),
-    ]
+    raise ValueError(f"Unsupported horizon: {horizon_sec}")
 
 
 def _selected_experiments(selection: str) -> list[Experiment]:
-    experiments = [
-        Experiment(name="30s_core", feature_specs=_build_30s_feature_specs()),
-    ]
+    experiments = [Experiment(name="core")]
     if selection == "all":
         return experiments
     return [experiment for experiment in experiments if experiment.name == selection]
 
 
-def _build_regression_target_builder() -> Callable[[dict[str, pl.DataFrame]], np.ndarray]:
+def _horizon_index(horizon_sec: int) -> int:
+    try:
+        return HORIZONS_SEC.index(horizon_sec)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported horizon: {horizon_sec}") from exc
+
+
+def _build_regression_target_builder(horizon_sec: int) -> Callable[[dict[str, pl.DataFrame]], np.ndarray]:
+    tau_idx = _horizon_index(horizon_sec)
+
     def build_target(chunk: dict[str, pl.DataFrame]) -> np.ndarray:
         stats = calculate_model_pnl(
             chunk[BINANCE_BTC_TRADES],
             chunk[BINANCE_BTC_BBO],
-            horizons_sec=(HORIZON_SEC,),
+            horizons_sec=HORIZONS_SEC,
         )
-        target = -np.asarray(stats["trade_pnl"][:, 0], dtype=np.float32)
-        valid_mask = np.asarray(stats["valid_mask"][:, 0], dtype=bool)
+        target = -np.asarray(stats["trade_pnl"][:, tau_idx], dtype=np.float32)
+        valid_mask = np.asarray(stats["valid_mask"][:, tau_idx], dtype=bool)
         return np.where(valid_mask, target, np.nan).astype(np.float32, copy=False)
 
     return build_target
@@ -265,8 +328,6 @@ class TimeProgressBar:
 
 def _fit_with_progress(pipeline: RegressionPipeline, chunk_sec: int, label: str) -> RegressionPipeline:
     data_loader = pipeline._data_loader
-    data_loader.reset()
-
     progress = TimeProgressBar(
         label=label,
         start_ts_us=data_loader.data_start_ts,
@@ -274,37 +335,10 @@ def _fit_with_progress(pipeline: RegressionPipeline, chunk_sec: int, label: str)
         chunk_sec=chunk_sec,
     )
     progress.start()
-
-    trained_chunks = 0
-    first_chunk = True
-
     try:
-        for chunk_idx, chunk in enumerate(data_loader, start=1):
-            X = pipeline._compute_feature_matrix(chunk)
-            y = pipeline._compute_target(chunk)
-            if y.shape[0] != X.shape[0]:
-                raise ValueError("Target size must match feature matrix rows")
-
-            sample_weight = pipeline._compute_sample_weights(chunk)
-            if sample_weight is not None and sample_weight.shape[0] != X.shape[0]:
-                raise ValueError("sample_weight size must match feature matrix rows")
-
-            X, y, sample_weight = pipeline._filter_training_rows(X, y, sample_weight)
-            if X.shape[0] == 0:
-                progress.update(chunk_idx)
-                continue
-
-            pipeline._fit_on_chunk(X, y, sample_weight, is_first_chunk=first_chunk)
-            first_chunk = False
-            trained_chunks += 1
-            progress.update(chunk_idx)
+        return pipeline.fit(log_i_chunk=None, on_chunk=progress.update)
     finally:
         progress.finish()
-        data_loader.reset()
-
-    if trained_chunks == 0:
-        raise ValueError("No non-empty chunks were used for training")
-    return pipeline
 
 
 def _weighted_regression_errors(
@@ -322,58 +356,61 @@ def _weighted_regression_errors(
     return rmse, mae
 
 
-def _evaluate_with_progress(
+def _collect_validation_predictions(
     pipeline: RegressionPipeline,
     val_loader: ParquetDataLoader,
-    chunk_sec: int,
-    max_filter_fraction: float,
-    experiment_name: str,
-) -> pl.DataFrame:
+    tau_idx: int,
+    on_chunk: Callable[[int], None] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     scores_parts: list[np.ndarray] = []
     pnl_parts: list[np.ndarray] = []
     valid_parts: list[np.ndarray] = []
     weights_parts: list[np.ndarray] = []
 
     val_loader.reset()
-    progress = TimeProgressBar(
-        label=f"Val {experiment_name}/{HORIZON_SEC}s",
-        start_ts_us=val_loader.data_start_ts,
-        end_ts_us=val_loader.data_end_ts,
-        chunk_sec=chunk_sec,
-    )
-    progress.start()
-
     try:
         for chunk_idx, chunk in enumerate(val_loader, start=1):
             scores = np.asarray(pipeline.predict_chunk(chunk, proba=False), dtype=np.float32).reshape(-1)
             stats = calculate_model_pnl(
                 chunk[BINANCE_BTC_TRADES],
                 chunk[BINANCE_BTC_BBO],
-                horizons_sec=(HORIZON_SEC,),
+                horizons_sec=HORIZONS_SEC,
             )
             scores_parts.append(scores)
-            pnl_parts.append(np.asarray(stats["trade_pnl"][:, 0], dtype=np.float32))
-            valid_parts.append(np.asarray(stats["valid_mask"][:, 0], dtype=bool))
+            pnl_parts.append(np.asarray(stats["trade_pnl"][:, tau_idx], dtype=np.float32))
+            valid_parts.append(np.asarray(stats["valid_mask"][:, tau_idx], dtype=bool))
             weights_parts.append(_build_sample_weights(chunk).astype(np.float32, copy=False))
-            progress.update(chunk_idx)
+            if on_chunk is not None:
+                on_chunk(chunk_idx)
     finally:
-        progress.finish()
         val_loader.reset()
 
-    scores = np.concatenate(scores_parts)
-    pnl_tau = np.concatenate(pnl_parts)
-    valid_tau = np.concatenate(valid_parts)
-    weights = np.concatenate(weights_parts)
+    return (
+        np.concatenate(scores_parts),
+        np.concatenate(pnl_parts),
+        np.concatenate(valid_parts),
+        np.concatenate(weights_parts),
+    )
 
+
+def _eligible_validation_rows(
+    scores: np.ndarray,
+    pnl_tau: np.ndarray,
+    valid_tau: np.ndarray,
+    weights: np.ndarray,
+    horizon_sec: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     eligible = np.flatnonzero(valid_tau)
     if eligible.size == 0:
-        raise ValueError(f"No valid rows in validation window for horizon {HORIZON_SEC}s")
+        raise ValueError(f"No valid rows in validation window for horizon {horizon_sec}s")
+    return scores[eligible], pnl_tau[eligible], weights[eligible]
 
-    eligible_scores = scores[eligible]
-    eligible_pnl = pnl_tau[eligible]
-    eligible_weights = weights[eligible]
-    weighted_rmse, weighted_mae = _weighted_regression_errors(eligible_scores, eligible_pnl, eligible_weights)
 
+def _worst_first_filter_cumulatives(
+    eligible_scores: np.ndarray,
+    eligible_pnl: np.ndarray,
+    eligible_weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float, float, float]:
     worst_first_idx = np.argsort(eligible_scores)[::-1]
     worst_weights = eligible_weights[worst_first_idx]
     worst_weighted_pnl = (eligible_pnl[worst_first_idx] * worst_weights).astype(np.float64)
@@ -385,14 +422,30 @@ def _evaluate_with_progress(
     total_weighted_pnl = float((eligible_pnl * eligible_weights).sum(dtype=np.float64))
     pnl_all = np.nan if total_weight == 0.0 else total_weighted_pnl / total_weight
 
-    eval_days = max(1.0, (val_loader.data_end_ts - val_loader.data_start_ts) / SECOND / (24 * 60 * 60))
+    return cum_filtered_weight, cum_filtered_weighted_pnl, total_weight, total_weighted_pnl, pnl_all
 
+
+def _build_filter_fraction_rows(
+    *,
+    experiment_name: str,
+    horizon_sec: int,
+    eligible_size: int,
+    eval_days: float,
+    max_filter_fraction: float,
+    cum_filtered_weight: np.ndarray,
+    cum_filtered_weighted_pnl: np.ndarray,
+    total_weight: float,
+    total_weighted_pnl: float,
+    pnl_all: float,
+    weighted_rmse: float,
+    weighted_mae: float,
+) -> list[dict]:
     max_filter_fraction = float(np.clip(max_filter_fraction, 0.0, 1.0))
     frac_steps = max(1, int(round(max_filter_fraction * 100)))
 
     rows = []
     for frac in np.linspace(0.0, max_filter_fraction, frac_steps + 1):
-        k = int(eligible.size * frac)
+        k = int(eligible_size * frac)
 
         filtered_weight = float(cum_filtered_weight[k])
         filtered_weighted_pnl = float(cum_filtered_weighted_pnl[k])
@@ -406,7 +459,7 @@ def _evaluate_with_progress(
         rows.append(
             {
                 "experiment": experiment_name,
-                "horizon_sec": HORIZON_SEC,
+                "horizon_sec": horizon_sec,
                 "filter_fraction": float(frac),
                 "score_bps": pnl_kept - pnl_all,
                 "pnl_all_bps": pnl_all,
@@ -418,7 +471,60 @@ def _evaluate_with_progress(
                 "weighted_mae_badness_bps": weighted_mae,
             }
         )
+    return rows
 
+
+def _evaluate_with_progress(
+    pipeline: RegressionPipeline,
+    val_loader: ParquetDataLoader,
+    chunk_sec: int,
+    max_filter_fraction: float,
+    experiment_name: str,
+    horizon_sec: int,
+) -> pl.DataFrame:
+    tau_idx = _horizon_index(horizon_sec)
+
+    progress = TimeProgressBar(
+        label=f"Val {experiment_name}/{horizon_sec}s",
+        start_ts_us=val_loader.data_start_ts,
+        end_ts_us=val_loader.data_end_ts,
+        chunk_sec=chunk_sec,
+    )
+    progress.start()
+    try:
+        scores, pnl_tau, valid_tau, weights = _collect_validation_predictions(
+            pipeline,
+            val_loader,
+            tau_idx,
+            on_chunk=progress.update,
+        )
+    finally:
+        progress.finish()
+
+    eligible_scores, eligible_pnl, eligible_weights = _eligible_validation_rows(
+        scores, pnl_tau, valid_tau, weights, horizon_sec
+    )
+    weighted_rmse, weighted_mae = _weighted_regression_errors(eligible_scores, eligible_pnl, eligible_weights)
+
+    cum_filtered_weight, cum_filtered_weighted_pnl, total_weight, total_weighted_pnl, pnl_all = (
+        _worst_first_filter_cumulatives(eligible_scores, eligible_pnl, eligible_weights)
+    )
+
+    eval_days = max(1.0, (val_loader.data_end_ts - val_loader.data_start_ts) / SECOND / (24 * 60 * 60))
+    rows = _build_filter_fraction_rows(
+        experiment_name=experiment_name,
+        horizon_sec=horizon_sec,
+        eligible_size=eligible_scores.size,
+        eval_days=eval_days,
+        max_filter_fraction=max_filter_fraction,
+        cum_filtered_weight=cum_filtered_weight,
+        cum_filtered_weighted_pnl=cum_filtered_weighted_pnl,
+        total_weight=total_weight,
+        total_weighted_pnl=total_weighted_pnl,
+        pnl_all=pnl_all,
+        weighted_rmse=weighted_rmse,
+        weighted_mae=weighted_mae,
+    )
     return pl.DataFrame(rows)
 
 
@@ -473,8 +579,87 @@ def _build_catboost_regressor(args: argparse.Namespace):
     )
 
 
+def _save_feature_importance(
+    pipeline: RegressionPipeline,
+    feature_specs: list[FeatureSpec],
+    output_dir: Path,
+    experiment_name: str,
+    horizon_sec: int,
+) -> Path:
+    model = pipeline.model._model
+    importances = model.get_feature_importance(type="FeatureImportance")
+    fi_df = pl.DataFrame(
+        {
+            "feature_name": [spec.feature.name for spec in feature_specs],
+            "importance": np.asarray(importances, dtype=np.float64),
+        }
+    ).sort("importance", descending=True)
+
+    fi_path = output_dir / f"{experiment_name}_{horizon_sec}s_feature_importance.csv"
+    fi_df.write_csv(fi_path)
+    return fi_path
+
+
+def _save_pipeline_artifacts(
+    output_dir: Path,
+    experiment_name: str,
+    horizon_sec: int,
+    feature_specs: list[FeatureSpec],
+    args: argparse.Namespace,
+    val_result: pl.DataFrame,
+    model_path: Path,
+    feature_importance_path: Path,
+    train_start_ts_us: int,
+    train_end_ts_us: int,
+    val_start_ts_us: int,
+    val_end_ts_us: int,
+) -> tuple[Path, Path]:
+    val_results_path = output_dir / f"{experiment_name}_{horizon_sec}s_val.csv"
+    metadata_path = output_dir / f"{experiment_name}_{horizon_sec}s.json"
+
+    val_result.write_csv(val_results_path)
+
+    best_row = (
+        val_result
+        .filter(pl.col("kept_turnover_per_day") >= MIN_TURNOVER_PER_DAY)
+        .sort("score_bps", descending=True)
+        .head(1)
+    )
+
+    best_summary = best_row.to_dicts()[0] if best_row.height > 0 else None
+
+    metadata = {
+        "experiment": experiment_name,
+        "horizon_sec": horizon_sec,
+        "model_path": str(model_path),
+        "val_results_path": str(val_results_path),
+        "feature_importance_path": str(feature_importance_path),
+        "train_window": {
+            "start": _format_utc(train_start_ts_us),
+            "end": _format_utc(train_end_ts_us),
+        },
+        "validation_window": {
+            "start": _format_utc(val_start_ts_us),
+            "end": _format_utc(val_end_ts_us),
+        },
+        "feature_names": [spec.feature.name for spec in feature_specs],
+        "n_features": len(feature_specs),
+        "model_params": {
+            "iterations": args.iterations,
+            "depth": args.depth,
+            "learning_rate": args.learning_rate,
+            "loss_function": args.loss_function,
+            "random_seed": args.random_seed,
+            "thread_count": args.thread_count,
+        },
+        "best_summary": best_summary,
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    return val_results_path, metadata_path
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train and validate 30s liquidation CatBoostRegressor experiment.")
+    parser = argparse.ArgumentParser(description="Train and validate liquidation CatBoostRegressor experiments.")
     parser.add_argument(
         "--train-until",
         default="2026-02-01",
@@ -512,7 +697,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--experiment",
-        choices=("all", "30s_core"),
+        choices=("all", "core"),
         default="all",
         help="Which experiment to run.",
     )
@@ -578,76 +763,89 @@ def main() -> None:
     all_results: list[pl.DataFrame] = []
 
     for experiment in _selected_experiments(args.experiment):
-        train_loader = _make_loader(datafiles, train_chunk_sec, train_from_ts_sec, train_until_ts_sec)
-        val_loader = _make_loader(datafiles, val_chunk_sec, valid_from_ts_sec, valid_until_ts_sec)
+        for horizon_sec in HORIZONS_SEC:
+            train_loader = _make_loader(datafiles, train_chunk_sec, train_from_ts_sec, train_until_ts_sec)
+            val_loader = _make_loader(datafiles, val_chunk_sec, valid_from_ts_sec, valid_until_ts_sec)
+            feature_specs = _build_feature_specs(horizon_sec)
 
-        print(f"\n=== Experiment={experiment.name} horizon={HORIZON_SEC}s ===")
-        print(
-            "Training window:",
-            _format_utc(train_loader.data_start_ts),
-            "->",
-            _format_utc(train_loader.data_end_ts),
-        )
-        print(
-            "Validation window:",
-            _format_utc(val_loader.data_start_ts),
-            "->",
-            _format_utc(val_loader.data_end_ts),
-        )
+            print(f"\n=== Experiment={experiment.name} horizon={horizon_sec}s ===")
+            print(
+                "Training window:",
+                _format_utc(train_loader.data_start_ts),
+                "->",
+                _format_utc(train_loader.data_end_ts),
+            )
+            print(
+                "Validation window:",
+                _format_utc(val_loader.data_start_ts),
+                "->",
+                _format_utc(val_loader.data_end_ts),
+            )
 
-        pipeline = RegressionPipeline(
-            model=_build_catboost_regressor(args),
-            feature_specs=experiment.feature_specs,
-            data_loader=train_loader,
-            target_builder=_build_regression_target_builder(),
-            sample_weight_builder=_build_sample_weights,
-        )
-        _fit_with_progress(
-            pipeline,
-            chunk_sec=train_chunk_sec,
-            label=f"Train {experiment.name}/{HORIZON_SEC}s",
-        )
+            pipeline = RegressionPipeline(
+                model=_build_catboost_regressor(args),
+                feature_specs=feature_specs,
+                data_loader=train_loader,
+                target_builder=_build_regression_target_builder(horizon_sec),
+                sample_weight_builder=_build_sample_weights,
+            )
 
-        val_result = _evaluate_with_progress(
-            pipeline=pipeline,
-            val_loader=val_loader,
-            chunk_sec=val_chunk_sec,
-            max_filter_fraction=args.max_filter_fraction,
-            experiment_name=experiment.name,
-        )
-        all_results.append(val_result)
+            _fit_with_progress(
+                pipeline,
+                chunk_sec=train_chunk_sec,
+                label=f"Train {experiment.name}/{horizon_sec}s",
+            )
 
-        best = (
-            val_result.filter(pl.col("kept_turnover_per_day") >= MIN_TURNOVER_PER_DAY)
-            .sort("score_bps", descending=True)
-            .head(1)
-        )
+            val_result = _evaluate_with_progress(
+                pipeline=pipeline,
+                val_loader=val_loader,
+                chunk_sec=val_chunk_sec,
+                max_filter_fraction=args.max_filter_fraction,
+                experiment_name=experiment.name,
+                horizon_sec=horizon_sec,
+            )
+            all_results.append(val_result)
 
-        print("\nBest by score_bps with turnover constraint:")
-        if best.height == 0:
-            print(f"No rows satisfy kept_turnover_per_day >= {MIN_TURNOVER_PER_DAY:.0f}.")
-        else:
-            print(best)
+            model_path = model_dir / f"{experiment.name}_{horizon_sec}s.cbm"
+            pipeline.model._model.save_model(str(model_path))
 
-        print("\nTop 10 by score_bps:")
-        print(val_result.sort("score_bps", descending=True).head(10))
+            feature_importance_path = _save_feature_importance(
+                pipeline=pipeline,
+                feature_specs=feature_specs,
+                output_dir=model_dir,
+                experiment_name=experiment.name,
+                horizon_sec=horizon_sec,
+            )
 
-        model_path = model_dir / f"{experiment.name}_{HORIZON_SEC}s.cbm"
-        pipeline.model._model.save_model(str(model_path))
-        print(f"\nSaved model to: {model_path}")
+            val_results_path, metadata_path = _save_pipeline_artifacts(
+                output_dir=model_dir,
+                experiment_name=experiment.name,
+                horizon_sec=horizon_sec,
+                feature_specs=feature_specs,
+                args=args,
+                val_result=val_result,
+                model_path=model_path,
+                feature_importance_path=feature_importance_path,
+                train_start_ts_us=train_loader.data_start_ts,
+                train_end_ts_us=train_loader.data_end_ts,
+                val_start_ts_us=val_loader.data_start_ts,
+                val_end_ts_us=val_loader.data_end_ts,
+            )
+
+            print(f"\nSaved model to: {model_path}")
+            print(f"Saved validation results to: {val_results_path}")
+            print(f"Saved feature importance to: {feature_importance_path}")
+            print(f"Saved pipeline metadata to: {metadata_path}")
 
     if all_results:
         summary = (
             pl.concat(all_results)
             .filter(pl.col("kept_turnover_per_day") >= MIN_TURNOVER_PER_DAY)
-            .sort("score_bps", descending=True)
-            .head(20)
+            .sort(["horizon_sec", "score_bps"], descending=[False, True])
         )
-        print("\n=== Summary: top rows across all experiments ===")
-        if summary.height == 0:
-            print(f"No rows satisfy kept_turnover_per_day >= {MIN_TURNOVER_PER_DAY:.0f}.")
-        else:
-            print(summary)
+        summary_path = model_dir / "summary.csv"
+        summary.write_csv(summary_path)
+        print(f"\nSaved summary to: {summary_path} ({summary.height} rows)")
 
 
 if __name__ == "__main__":

@@ -93,8 +93,8 @@ class BboSpreadBps(BboFeature):
 
 
 class BboVolumeImbalance(BboFeature):
-    def __init__(self):
-        super().__init__("bbo_volume_imbalance")
+    def __init__(self, name="bbo_volume_imbalance"):
+        super().__init__(name)
 
     def calculate(self, **data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         ctx = self._prepare_bbo_window(**data)
@@ -121,8 +121,8 @@ class BboVolumeImbalance(BboFeature):
 
 
 class BboMidSmoothDeltaBps(BboFeature):
-    def __init__(self):
-        super().__init__("bbo_mid_smooth_delta_bps")
+    def __init__(self, name: str = "bbo_mid_smooth_delta_bps"):
+        super().__init__(name)
 
     def calculate(self, **data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         ctx = self._prepare_bbo_window(**data)
@@ -212,8 +212,8 @@ class BboMidDeltaBps(BboFeature):
 
 
 class BboMicroPricePremiumBps(BboFeature):
-    def __init__(self):
-        super().__init__("bbo_micro_price_premium_bps")
+    def __init__(self, name="bbo_micro_price_premium_bps"):
+        super().__init__(name)
 
     def calculate(self, **data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         ctx = self._prepare_bbo_window(**data)
@@ -262,8 +262,8 @@ class BboVolumeImbalanceAbs(BboFeature):
 
 
 class TradeBboEdgeBps(BboFeature):
-    def __init__(self):
-        super().__init__("trade_bbo_edge_bps")
+    def __init__(self, name: str = "trade_bbo_edge_bps"):
+        super().__init__(name)
 
     def calculate(self, **data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         ctx = self._prepare_bbo_window(**data)

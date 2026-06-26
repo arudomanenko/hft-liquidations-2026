@@ -117,7 +117,12 @@ class ModelPipeline:
         sample_weight_filtered = sample_weight[keep_mask] if sample_weight is not None else None
         return X_filtered, y_filtered, sample_weight_filtered
 
-    def _fit_stream(self, data_stream: Iterable[Chunk], log_i_chunk: Optional[int] = 1) -> int:
+    def _fit_stream(
+        self,
+        data_stream: Iterable[Chunk],
+        log_i_chunk: Optional[int] = 1,
+        on_chunk: Optional[Callable[[int], None]] = None,
+    ) -> int:
         trained_chunks = 0
         first_chunk = True
 
@@ -132,14 +137,15 @@ class ModelPipeline:
                 raise ValueError("sample_weight size must match feature matrix rows")
 
             X, y, sample_weight = self._filter_training_rows(X, y, sample_weight)
-            if X.shape[0] == 0:
-                continue
+            if X.shape[0] != 0:
+                self._fit_on_chunk(X, y, sample_weight, is_first_chunk=first_chunk)
+                first_chunk = False
+                trained_chunks += 1
+                if log_i_chunk is not None and chunk_idx % log_i_chunk == 0:
+                    print(f"Training chunk={chunk_idx} rows={X.shape[0]}")
 
-            self._fit_on_chunk(X, y, sample_weight, is_first_chunk=first_chunk)
-            first_chunk = False
-            trained_chunks += 1
-            if log_i_chunk is not None and chunk_idx % log_i_chunk == 0:
-                print(f"Training chunk={chunk_idx} rows={X.shape[0]}")
+            if on_chunk is not None:
+                on_chunk(chunk_idx)
 
         return trained_chunks
 
@@ -178,13 +184,18 @@ class ModelPipeline:
     def fit(
         self,
         log_i_chunk: Optional[int] = 1,
+        on_chunk: Optional[Callable[[int], None]] = None,
     ) -> "ModelPipeline":
         if log_i_chunk is not None and log_i_chunk <= 0:
             raise ValueError("log_i_chunk must be positive or None")
         self._data_loader.reset()
 
         try:
-            trained_chunks = self._fit_stream(self._data_loader, log_i_chunk=log_i_chunk)
+            trained_chunks = self._fit_stream(
+                self._data_loader,
+                log_i_chunk=log_i_chunk,
+                on_chunk=on_chunk,
+            )
         finally:
             self._data_loader.reset()
 
